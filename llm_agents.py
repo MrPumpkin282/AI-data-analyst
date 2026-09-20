@@ -3,7 +3,35 @@ import re
 from config import client, NVIDIA_MODEL
 
 
-def call_planner_llm(schema_text: str, question: str) -> tuple[dict, str]:
+def _extract_json_from_text(text: str) -> dict | None:
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    code_block_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text, re.DOTALL)
+    if code_block_match:
+        try:
+            return json.loads(code_block_match.group(1))
+        except json.JSONDecodeError:
+            pass
+    for i, char in enumerate(text):
+        if char == '{':
+            decoder = json.JSONDecoder()
+            try:
+                parsed, _ = decoder.raw_decode(text[i:])
+                if isinstance(parsed, dict) and any(
+                    k in parsed for k in ['operation', 'target_column', 'metric', 'group_by']
+                ):
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def _call_planner_once(schema_text: str, question: str, retry_note: str = "") -> tuple[dict | None, str, str]:
     system_prompt = """
     You are a data analysis planner. Convert user questions into JSON plans.
     JSON Structure (REQUIRED):
@@ -28,16 +56,17 @@ def call_planner_llm(schema_text: str, question: str) -> tuple[dict, str]:
     - Use ONLY columns from the provided schema
     - For "this year", look for year columns or use the latest year in data
     - For "top N", use appropriate group_by and metric
-    - For comparisons, use filters to split groups 
+    - For comparisons, use filters to split groups
     Think briefly, then output the complete JSON.
     """.strip()
 
+    user_content = f"Dataset:\n{schema_text}\n\nQuestion:\n{question}\n\nReminder: After analyzing, output the complete JSON plan."
+    if retry_note:
+        user_content += f"\n\n{retry_note}"
+
     messages = [
         {"role": "system", "content": system_prompt},
-        {
-            "role": "user",
-            "content": f"Dataset:\n{schema_text}\n\nQuestion:\n{question}\n\nReminder: After analyzing, output the complete JSON plan.",
-        },
+        {"role": "user", "content": user_content},
     ]
 
     resp = client.chat.completions.create(
@@ -47,90 +76,39 @@ def call_planner_llm(schema_text: str, question: str) -> tuple[dict, str]:
     )
 
     message = resp.choices[0].message
-    content = message.content or ""
-    content = content.strip()
+    content = (message.content or "").strip()
     reasoning_content = getattr(message, 'reasoning_content', None) or ""
     finish_reason = resp.choices[0].finish_reason
 
-    def extract_json_from_text(text: str) -> dict | None:
-        if not text:
-            return None
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-        code_block_match = re.search(r'```(?:json)?\s*(\{[\s\S]*?\})\s*```', text, re.DOTALL)
-        if code_block_match:
-            try:
-                return json.loads(code_block_match.group(1))
-            except json.JSONDecodeError:
-                pass
+    plan = _extract_json_from_text(reasoning_content) or _extract_json_from_text(content)
+    return plan, reasoning_content, finish_reason
 
-        def find_all_json_objects(s):
-            objects = []
-            depth = 0
-            start_idx = None
-            in_string = False
-            escape_next = False
-            for i, char in enumerate(s):
-                if escape_next:
-                    escape_next = False
-                    continue
-                if char == '\\':
-                    escape_next = True
-                    continue
-                if char == '"' and not in_string:
-                    in_string = True
-                elif char == '"' and in_string:
-                    in_string = False
-                elif not in_string:
-                    if char == '{':
-                        if depth == 0:
-                            start_idx = i
-                        depth += 1
-                    elif char == '}':
-                        depth -= 1
-                        if depth == 0 and start_idx is not None:
-                            objects.append(s[start_idx:i + 1])
-                            start_idx = None
-            return objects
 
-        for candidate in find_all_json_objects(text):
-            try:
-                parsed = json.loads(candidate)
-                if isinstance(parsed, dict) and any(k in parsed for k in ['operation', 'target_column', 'metric', 'group_by']):
-                    return parsed
-            except json.JSONDecodeError:
-                continue
+def call_planner_llm(schema_text: str, question: str, max_retries: int = 1) -> tuple[dict, str]:
+    last_reasoning = ""
+    last_finish_reason = ""
+    last_content_sample = ""
 
-        for i in range(len(text)):
-            if text[i] == '{':
-                decoder = json.JSONDecoder()
-                try:
-                    parsed, _ = decoder.raw_decode(text[i:])
-                    if isinstance(parsed, dict) and any(k in parsed for k in ['operation', 'target_column', 'metric', 'group_by']):
-                        return parsed
-                except json.JSONDecodeError:
-                    continue
-        return None
+    for attempt in range(max_retries + 1):
+        retry_note = (
+            "Your previous response did not contain valid JSON. "
+            "Output ONLY the JSON object, no prose, no markdown fences."
+            if attempt > 0 else ""
+        )
+        plan, reasoning_content, finish_reason = _call_planner_once(schema_text, question, retry_note)
+        last_reasoning = reasoning_content
+        last_finish_reason = finish_reason
 
-    if reasoning_content:
-        plan = extract_json_from_text(reasoning_content)
         if plan is not None:
             return plan, reasoning_content
 
-    plan = extract_json_from_text(content)
-    if plan is not None:
-        return plan, reasoning_content
-
     error_msg = (
-        f"Planner returned non-JSON content.\n"
-        f"Finish reason: {finish_reason}\n"
-        f"Content received: {repr(content[:500]) if content else '(empty)'}\n"
-        f"Reasoning content length: {len(reasoning_content) if reasoning_content else 0}\n"
-        f"Reasoning content sample: {reasoning_content[:500] if reasoning_content else '(none)'}"
+        f"Planner returned non-JSON content after {max_retries + 1} attempt(s).\n"
+        f"Finish reason: {last_finish_reason}\n"
+        f"Reasoning content length: {len(last_reasoning) if last_reasoning else 0}\n"
+        f"Reasoning content sample: {last_reasoning[:500] if last_reasoning else '(none)'}"
     )
-    if finish_reason == "length":
+    if last_finish_reason == "length":
         error_msg += "\n\nNote: Response was truncated due to token limit. The model didn't finish generating the JSON."
 
     raise ValueError(error_msg)
@@ -148,7 +126,7 @@ def call_explainer_llm(question: str, plan: dict, result_summary: list) -> tuple
     - Include specific numbers and percentages where relevant
     - Use business-friendly language (avoid technical jargon like "aggregation", "groupby")
     - If the data shows interesting patterns, point them out
-    - End with a brief recommendation or next step if appropriate    
+    - End with a brief recommendation or next step if appropriate
     Keep it concise and actionable.
     """.strip()
 
@@ -160,7 +138,7 @@ def call_explainer_llm(question: str, plan: dict, result_summary: list) -> tuple
     Analysis performed:
     {json.dumps(plan, indent=2)}
     Results (top rows):
-    {json.dumps(limited_summary, indent=2)}    
+    {json.dumps(limited_summary, indent=2)}
     Total rows in result: {len(result_summary)}
     """.strip()
 
@@ -176,13 +154,11 @@ def call_explainer_llm(question: str, plan: dict, result_summary: list) -> tuple
     )
 
     message = resp.choices[0].message
-    content = message.content or ""
-    content = content.strip()
+    content = (message.content or "").strip()
     reasoning_content = getattr(message, 'reasoning_content', None) or ""
 
-    if not content:
-        if reasoning_content:
-            content = reasoning_content.strip()
+    if not content and reasoning_content:
+        content = reasoning_content.strip()
 
     return (content if content else "Unable to generate explanation from the model response.",
             reasoning_content)

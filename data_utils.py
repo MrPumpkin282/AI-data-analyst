@@ -25,7 +25,7 @@ def preprocess_dates(df: pd.DataFrame) -> pd.DataFrame:
                 df[col] = pd.to_datetime(df[col], errors='coerce')
                 if df[col].notna().sum() > 0:
                     date_columns.append(col)
-            except:
+            except Exception:
                 pass
     for col in date_columns:
         if col in df.columns and pd.api.types.is_datetime64_any_dtype(df[col]):
@@ -45,10 +45,17 @@ def apply_filters(df: pd.DataFrame, filters: list) -> pd.DataFrame:
         val = f.get("value")
         if col not in filtered.columns:
             continue
-        try:
-            val_cast = pd.to_numeric(val)
-        except Exception:
-            val_cast = val
+
+        # Cast the filter value to match the column's dtype so comparisons
+        # actually match instead of silently returning zero rows.
+        if pd.api.types.is_datetime64_any_dtype(filtered[col]):
+            val_cast = pd.to_datetime(val, errors='coerce')
+        else:
+            try:
+                val_cast = pd.to_numeric(val)
+            except Exception:
+                val_cast = val
+
         if op == "==":
             filtered = filtered[filtered[col] == val_cast]
         elif op == "!=":
@@ -78,6 +85,10 @@ def run_analysis_plan(df: pd.DataFrame, plan: dict) -> pd.DataFrame:
 
     if not op or not target_col or target_col not in df.columns:
         return df.head(20)
+
+    # Drop any group_by columns the LLM invented that aren't in the schema,
+    # instead of letting groupby() raise a raw KeyError downstream.
+    group_by = [g for g in group_by if g in df.columns]
 
     if op in ("aggregate_compare", "group_by_summary", "filter_then_aggregate"):
         if not group_by:

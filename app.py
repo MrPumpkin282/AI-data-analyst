@@ -6,6 +6,8 @@ from data_utils import get_schema_description, preprocess_dates, run_analysis_pl
 from llm_agents import call_explainer_llm, call_planner_llm
 from styles import CUSTOM_CSS
 
+MAX_ROWS = 200_000
+
 st.set_page_config(
     page_title="AI Data Analyst Agent",
     page_icon="📊",
@@ -25,6 +27,14 @@ if uploaded_file is not None:
     except Exception as e:
         st.error(f"Error loading CSV: {e}")
         st.stop()
+
+    if df.empty:
+        st.error("The uploaded CSV has no rows. Please upload a file with data.")
+        st.stop()
+
+    if len(df) > MAX_ROWS:
+        st.warning(f"File has {len(df):,} rows — using the first {MAX_ROWS:,} for analysis.")
+        df = df.head(MAX_ROWS)
 
     with st.expander("Preview Data", expanded=False):
         col1, col2, col3 = st.columns(3)
@@ -108,7 +118,7 @@ if uploaded_file is not None:
             for col in result_df_serializable.columns:
                 if pd.api.types.is_datetime64_any_dtype(result_df_serializable[col]):
                     result_df_serializable[col] = result_df_serializable[col].astype(str)
-                elif pd.api.types.is_period_dtype(result_df_serializable[col]):
+                elif isinstance(result_df_serializable[col].dtype, pd.PeriodDtype):
                     result_df_serializable[col] = result_df_serializable[col].astype(str)
             result_summary = result_df_serializable.to_dict(orient="records")
 
