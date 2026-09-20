@@ -1,7 +1,6 @@
 import json
 import re
-
-from config import client, OLLAMA_MODEL
+from config import client, NVIDIA_MODEL
 
 
 def call_planner_llm(schema_text: str, question: str) -> tuple[dict, str]:
@@ -42,7 +41,7 @@ def call_planner_llm(schema_text: str, question: str) -> tuple[dict, str]:
     ]
 
     resp = client.chat.completions.create(
-        model=OLLAMA_MODEL,
+        model=NVIDIA_MODEL,
         messages=messages,
         max_tokens=8192,
     )
@@ -171,7 +170,7 @@ def call_explainer_llm(question: str, plan: dict, result_summary: list) -> tuple
     ]
 
     resp = client.chat.completions.create(
-        model=OLLAMA_MODEL,
+        model=NVIDIA_MODEL,
         messages=messages,
         max_tokens=2048,
     )
